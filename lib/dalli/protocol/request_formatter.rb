@@ -121,30 +121,33 @@ module Dalli
         # Pass terminate: false to leave off the trailing noop, for callers
         # (the pipelined set) that send it separately.
         def multi_meta_set(entries, ttl: nil, terminate: true, p_token: nil, l_token: nil)
-          # Routing tokens apply to every entry in the batch, so the suffix is
-          # built once rather than per entry. It's binary, like the buffer, so
-          # a token with non-ASCII characters doesn't turn the buffer UTF-8.
-          token_suffix = routing_tokens(p_token: p_token, l_token: l_token).b
-          ttl = ttl_flag(:ttl, ttl) if ttl
-
-          buffer = ''.b
-          entries.each do |key, pair|
-            value, bitflags = pair
-
-            base64 = KeyRegularizer.required?(key)
-            key = KeyRegularizer.encode(key) if base64
-
-            # Inline format: "ms <key> <size> c [b] F<flags> T<ttl> MS q [P/L]\r\n"
-            buffer << "ms #{key} #{value.bytesize} c"
-            buffer << ' b' if base64
-            buffer << " F#{bitflags}" if bitflags
-            buffer << " T#{ttl}" if ttl
-            buffer << ' MS q' << token_suffix << TERMINATOR
-            append_bytes(buffer, value)
-            buffer << TERMINATOR
-          end
-          terminate ? buffer << META_NOOP : buffer
+          build_multi_meta_set(entries, ttl, terminate, p_token, l_token, nil)
         end
+
+        # The requests multi_meta_set builds, as an Array of Strings to write
+        # in order. A value of at least SEPARATE_VALUE_BYTES is its own
+        # element rather than copied in with the requests around it, so a
+        # batch of large values isn't copied (see
+        # ConnectionManager::WRITEV_MIN_PART_BYTES).
+        def multi_meta_set_parts(entries, ttl: nil, terminate: true, p_token: nil, l_token: nil)
+          build_multi_meta_set(entries, ttl, terminate, p_token, l_token, [])
+        end
+
+        SEPARATE_VALUE_BYTES = 32 * 1024
+
+        # Values are appended as bytes. One batch can hold UTF-8 and binary
+        # values, which String#<< refuses to combine, and a raw value can be in
+        # an encoding that isn't ASCII-compatible, such as UTF-16.
+        if String.method_defined?(:append_as_bytes)
+          def append_bytes(buffer, value)
+            buffer.append_as_bytes(value)
+          end
+        else
+          def append_bytes(buffer, value)
+            buffer << (value.encoding == Encoding::BINARY ? value : value.b)
+          end
+        end
+        private :append_bytes
 
         # Thundering herd protection flag:
         # - stale (I flag): Instead of deleting the item, mark it as stale. Other clients
@@ -284,19 +287,43 @@ module Dalli
 
         private
 
-        # Values are appended as bytes. One batch can hold UTF-8 and binary
-        # values, which String#<< refuses to combine, and a raw value can be in
-        # an encoding that isn't ASCII-compatible, such as UTF-16.
-        # Don't chain on the result: TruffleRuby's append_as_bytes returns its
-        # arguments rather than the buffer.
-        if String.method_defined?(:append_as_bytes)
-          def append_bytes(buffer, value)
-            buffer.append_as_bytes(value)
+        # With parts, an Array, values of at least SEPARATE_VALUE_BYTES are
+        # added to it on their own, the requests between them as Strings, and
+        # it's returned; otherwise the requests are built in one String.
+        # rubocop:disable-next Metrics/ParameterLists
+        def build_multi_meta_set(entries, ttl, terminate, p_token, l_token, parts)
+          # The flags after F are the same for every entry, so they're built once
+          suffix = "#{" T#{ttl_flag(:ttl, ttl)}" if ttl} MS q#{routing_tokens(p_token: p_token, l_token: l_token)}" \
+                   "#{TERMINATOR}".b
+
+          buffer = ''.b
+          entries.each do |key, pair|
+            value, bitflags = pair
+
+            buffer << multi_set_header(key, value.bytesize, bitflags) << suffix
+            if parts && value.bytesize >= SEPARATE_VALUE_BYTES
+              parts << buffer << value
+              buffer = String.new(TERMINATOR, capacity: 1024, encoding: Encoding::BINARY)
+            else
+              # Don't chain on the result: TruffleRuby's append_as_bytes
+              # returns its arguments rather than the buffer.
+              append_bytes(buffer, value)
+              buffer << TERMINATOR
+            end
           end
-        else
-          def append_bytes(buffer, value)
-            buffer << (value.encoding == Encoding::BINARY ? value : value.b)
-          end
+          buffer << META_NOOP if terminate
+          parts ? parts << buffer : buffer
+        end
+
+        # "ms <key> <size> c [b] [F<flags>]", to be followed by the flags
+        # every entry shares: "[T<ttl>] MS q [P/L]\r\n"
+        def multi_set_header(key, size, bitflags)
+          header = if KeyRegularizer.required?(key)
+                     "ms #{KeyRegularizer.encode(key)} #{size} c b"
+                   else
+                     "ms #{key} #{size} c"
+                   end
+          bitflags ? header << " F#{bitflags}" : header
         end
 
         # Disallowed bytes: whitespace and control characters. CR, LF or NUL
