@@ -144,10 +144,35 @@ module Dalli
         response_processor.meta_set_with_cas unless quiet?
       end
 
-      # Pipelined set - writes a quiet set request without reading response.
-      # Used by PipelinedSetter for bulk operations.
-      def pipelined_set(key, value, ttl, options)
-        write_storage_req(:set, key, value, ttl, nil, options, quiet: true)
+      # One server's share of a multi-server set_multi: a quiet set for each
+      # of keys (values looked up in pairs), written as one batch, without the
+      # terminating noop or reading replies. PipelinedSetter sends the noop to
+      # every server once all are written, then reads each server's replies.
+      #
+      # A value that can't be marshalled or is over value_max_bytes is skipped
+      # and the first such error returned rather than raised, so the server's
+      # other keys are still written.
+      def pipelined_set_multi(keys, pairs, ttl, options)
+        ttl = TtlSanitizer.sanitize(ttl) if ttl
+        entries, value_error = marshal_entries(keys, pairs, options, log: true)
+        unless entries.empty?
+          write(RequestFormatter.multi_meta_set(entries, ttl: ttl, terminate: false, **routing_token_kwargs(options)))
+        end
+        value_error
+      end
+
+      # [key, [value, bitflags]] for each key whose value can be stored, and
+      # the first error from one that can't
+      def marshal_entries(keys, pairs, options, log: false)
+        value_error = nil
+        entries = keys.filter_map do |key|
+          [key, @value_marshaller.store(key, pairs[key], options)]
+        rescue Dalli::MarshalError, Dalli::ValueOverMaxSize => e
+          log_marshal_err(key, e) if log && e.is_a?(Dalli::MarshalError)
+          value_error ||= e
+          nil
+        end
+        [entries, value_error]
       end
 
       def add(key, value, ttl, options)
@@ -305,9 +330,7 @@ module Dalli
       # in a quiet block stays buffered until a noop: the one at the end of the
       # block, or the one another thread or fiber sends to drain the block's
       # replies before its own request. With defer_drain no noop follows at the
-      # end of the block, so it is flushed right away. (pipelined_set passes
-      # quiet: true outside a quiet block; its caller flushes with a
-      # terminating noop.)
+      # end of the block, so it is flushed right away.
       def finish_write(quiet)
         @connection_manager.flush if !quiet || (@defer_drain && quiet?)
       end
@@ -465,13 +488,7 @@ module Dalli
       # (as PipelinedSetter does on the multi-server path).
       def write_multi_req(pairs, ttl, req_options)
         ttl = TtlSanitizer.sanitize(ttl) if ttl
-        value_error = nil
-        entries = pairs.filter_map do |key, raw_value|
-          [key, @value_marshaller.store(key, raw_value, req_options)]
-        rescue Dalli::MarshalError, Dalli::ValueOverMaxSize => e
-          value_error ||= e
-          nil
-        end
+        entries, value_error = marshal_entries(pairs.each_key, pairs, req_options)
 
         unless entries.empty?
           buffer = RequestFormatter.multi_meta_set(entries, ttl: ttl, **routing_token_kwargs(req_options))
