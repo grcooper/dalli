@@ -50,6 +50,14 @@ module DalliFuzz
 
       reusable_buffer ? reusable_buffer.replace(data) : data
     end
+
+    # Like Dalli::Socket#append_available, in the same chunks
+    def append_available(target, max_bytes = @chunk_size)
+      data = @io.read([@chunk_size, max_bytes].compact.min)
+      raise Dalli::NetworkError, 'Connection reset' if data.nil?
+
+      target << data
+    end
   end
 
   def self.value_marshaller
