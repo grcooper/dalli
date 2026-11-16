@@ -18,7 +18,11 @@ module Dalli
     # Common methods for all socket implementations.
     ##
     module InstanceMethods
-      READ_CHUNK_SIZE = 8196
+      # Bytes asked of each read_nonblock. A get_multi of large values moves
+      # megabytes, and each read is a system call and a trip through
+      # IO.select, so this is well above a typical reply; a smaller reply
+      # still costs one read, which comes back short.
+      READ_CHUNK_SIZE = 64 * 1024
       # Give the response parser control between bounded socket reads. In
       # particular, a peer continuously sending a header without CRLF must
       # not keep this method appending forever.
@@ -28,36 +32,38 @@ module Dalli
       # than a full chunk means the socket was drained, so we stop there rather
       # than spend another read_nonblock call just to get :wait_readable back.
       # Callers keep waiting on IO.select for anything that arrives later.
+      #
+      # read_nonblock's result is checked with if, not case/when: a case with
+      # Symbol branches compiles to a hash lookup, which hashes a String
+      # result, every byte of it, on each read.
       def read_available(reusable_buffer = nil)
         if reusable_buffer
           value = read_nonblock([READ_CHUNK_SIZE, MAX_AVAILABLE_BYTES].min, reusable_buffer, exception: false)
-          case value
-          when :wait_writable, :wait_readable
-            return reusable_buffer.clear
-          when nil
-            raise Errno::ECONNRESET, "Connection reset: #{logged_options.inspect}"
-          end
+          return reusable_buffer.clear if value.is_a?(Symbol) # :wait_readable or :wait_writable
+          raise Errno::ECONNRESET, "Connection reset: #{logged_options.inspect}" if value.nil?
           return value if drained_after?(value)
           return value if value.bytesize >= MAX_AVAILABLE_BYTES
         else
           value = ''.b
         end
 
-        buffer = ''.b
+        append_available(value, MAX_AVAILABLE_BYTES - value.bytesize)
+      end
+
+      # Like read_available, but appends what's available, up to max_bytes,
+      # to target rather than returning it, so the bytes are copied once, from
+      # a scratch buffer kept for the next call. Returns target.
+      def append_available(target, max_bytes = MAX_AVAILABLE_BYTES)
+        scratch = (@append_scratch ||= ''.b)
+        appended = 0
         loop do
-          result = read_nonblock([READ_CHUNK_SIZE, MAX_AVAILABLE_BYTES - value.bytesize].min,
-                                 buffer, exception: false)
-          case result
-          when :wait_writable, :wait_readable
-            buffer.clear
-            return value
-          when nil
-            raise Errno::ECONNRESET, "Connection reset: #{logged_options.inspect}"
-          else
-            value << result
-            return value if drained_after?(result)
-            return value if value.bytesize >= MAX_AVAILABLE_BYTES
-          end
+          result = read_nonblock([READ_CHUNK_SIZE, max_bytes - appended].min, scratch, exception: false)
+          return target if result.is_a?(Symbol) # :wait_readable or :wait_writable
+          raise Errno::ECONNRESET, "Connection reset: #{logged_options.inspect}" if result.nil?
+
+          target << result
+          appended += result.bytesize
+          return target if drained_after?(result) || appended >= max_bytes
         end
       end
 

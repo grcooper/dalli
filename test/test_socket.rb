@@ -281,6 +281,47 @@ describe 'Dalli::Socket::InstanceMethods#read_available' do
 
     assert_equal '', sock.read_available(''.b)
   end
+
+  it 'raises ECONNRESET at EOF' do
+    sock = scripted_socket([nil])
+    sock.define_singleton_method(:options) { {} }
+
+    assert_raises(Errno::ECONNRESET) { sock.read_available(''.b) }
+  end
+
+  describe '#append_available' do
+    it 'appends what is available to the target and returns it' do
+      sock = scripted_socket([full_chunk, 'tail'])
+      target = +'head'
+
+      assert_same target, sock.append_available(target)
+      assert_equal "head#{full_chunk}tail", target
+      assert_equal 2, sock.read_calls
+    end
+
+    it 'leaves the target as it is when nothing is available' do
+      sock = scripted_socket([:wait_readable])
+      target = +'head'
+
+      assert_equal 'head', sock.append_available(target)
+    end
+
+    it 'reads a bounded number of full chunks' do
+      max_bytes = Dalli::Socket::InstanceMethods::MAX_AVAILABLE_BYTES
+      reads = (max_bytes / full_chunk.bytesize) + 2
+      sock = scripted_socket(Array.new(reads, full_chunk))
+
+      assert_equal max_bytes, sock.append_available(+'').bytesize
+      assert_operator sock.read_calls, :<, reads
+    end
+
+    it 'raises ECONNRESET at EOF' do
+      sock = scripted_socket([full_chunk, nil])
+      sock.define_singleton_method(:options) { {} }
+
+      assert_raises(Errno::ECONNRESET) { sock.append_available(+'') }
+    end
+  end
 end
 
 describe 'Dalli::Socket::SSLSocket#read_available' do

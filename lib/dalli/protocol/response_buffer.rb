@@ -35,7 +35,7 @@ module Dalli
             @buffer.bytesplice(0, @offset, '')
             @offset = 0
           end
-          @buffer << @io_source.read_available
+          @io_source.append_available(@buffer)
         end
       end
 
