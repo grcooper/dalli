@@ -351,6 +351,11 @@ module Dalli
         @sock.read_available(...)
       end
 
+      def append_available(target)
+        flush_write_buffer
+        @sock.append_available(target)
+      end
+
       def max_allowed_failures
         @max_allowed_failures ||= @options[:socket_max_failures] || 2
       end
