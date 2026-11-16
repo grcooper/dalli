@@ -45,6 +45,7 @@ module Dalli
         @pid = nil
         @write_buffer = []
         @write_buffer_bytes = 0
+        @writev = false
         @response_buffer = nil
 
         @fail_count = 0
@@ -321,11 +322,35 @@ module Dalli
       # is sent once it grows past this size, or when a reply is read.
       WRITE_BUFFER_FLUSH_BYTES = 64 * 1024
 
+      # A write at least this large is sent where it is, in a writev with the
+      # writes around it, rather than copied into a joined buffer first: a
+      # set_multi of large values would otherwise copy every value
+      WRITEV_MIN_PART_BYTES = 32 * 1024
+      # Parts per writev, well under IOV_MAX: given more, IO#write sends them
+      # through the IO's own write buffer (see WRITE_BUFFER_FLUSH_BYTES)
+      WRITEV_MAX_PARTS = 64
+
       def write(bytes)
         @write_buffer << bytes
         @write_buffer_bytes += bytes.bytesize
+        @writev = true if bytes.bytesize >= WRITEV_MIN_PART_BYTES
         flush_write_buffer if @write_buffer_bytes >= WRITE_BUFFER_FLUSH_BYTES
         bytes.bytesize
+      rescue SystemCallError, *TIMEOUT_ERRORS, *SSL_ERRORS, IOError => e
+        error_on_request!(e)
+      end
+
+      # Queues parts for one write, without sending them as they pass
+      # WRITE_BUFFER_FLUSH_BYTES: they're the caller's Strings, not copies, so
+      # queueing them all costs no memory, and a large value is sent with the
+      # rest rather than in a write of its own. Flushed at the end.
+      def write_parts(parts)
+        parts.each do |bytes|
+          @write_buffer << bytes
+          @write_buffer_bytes += bytes.bytesize
+          @writev = true if bytes.bytesize >= WRITEV_MIN_PART_BYTES
+        end
+        flush_write_buffer if @write_buffer_bytes >= WRITE_BUFFER_FLUSH_BYTES
       rescue SystemCallError, *TIMEOUT_ERRORS, *SSL_ERRORS, IOError => e
         error_on_request!(e)
       end
@@ -452,7 +477,13 @@ module Dalli
 
         # Set before writing: a write that fails may still have sent some bytes
         @request_sent = true if @request_in_progress
-        timed_tls_operation { @sock.write(@write_buffer.size == 1 ? @write_buffer.first : joined_write_buffer) }
+        if @write_buffer.size == 1
+          timed_tls_operation { @sock.write(@write_buffer.first) }
+        elsif @writev && !@sock.is_a?(Dalli::Socket::SSLSocket)
+          @write_buffer.each_slice(WRITEV_MAX_PARTS) { |parts| @sock.write(*parts) }
+        else
+          timed_tls_operation { @sock.write(joined_write_buffer) }
+        end
         discard_write_buffer
       end
 
@@ -475,6 +506,7 @@ module Dalli
       def discard_write_buffer
         @write_buffer.clear
         @write_buffer_bytes = 0
+        @writev = false
       end
 
       # Reads exactly `count` bytes. IO#read(count) on a blocking socket blocks

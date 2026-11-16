@@ -371,6 +371,39 @@ describe Dalli::Protocol::Meta::RequestFormatter do
     end
   end
 
+  describe 'multi_meta_set_parts' do
+    let(:formatter) { Dalli::Protocol::Meta::RequestFormatter }
+    let(:large) { 'L' * Dalli::Protocol::Meta::RequestFormatter::SEPARATE_VALUE_BYTES }
+
+    it 'joins to the bytes multi_meta_set builds' do
+      entries = { 'a' => ['small', 0], 'b' => [large, 2], 'c€' => ['é', 0], 'd' => [large.b, 0] }
+
+      [{}, { ttl: 42 }, { terminate: false }, { p_token: 'pod1' }].each do |opts|
+        parts = formatter.multi_meta_set_parts(entries, **opts)
+
+        assert_equal formatter.multi_meta_set(entries, **opts), parts.map(&:b).join, opts.inspect
+      end
+    end
+
+    it 'keeps each large value as its own part, without copying it' do
+      entries = { 'a' => ['small', 0], 'b' => [large, 0], 'c' => [large, 0] }
+      parts = formatter.multi_meta_set_parts(entries)
+
+      assert_equal 5, parts.size
+      assert_same large, parts[1]
+      assert_same large, parts[3]
+      assert_equal "ms a 5 c F0 MS q\r\nsmall\r\nms b #{large.bytesize} c F0 MS q\r\n", parts[0]
+      assert_equal "\r\nms c #{large.bytesize} c F0 MS q\r\n", parts[2]
+      assert_equal "\r\nmn\r\n", parts[4]
+    end
+
+    it 'returns one part when no value is large' do
+      entries = { 'a' => ['small', 0], 'b' => ['x' * 100, 0] }
+
+      assert_equal [formatter.multi_meta_set(entries)], formatter.multi_meta_set_parts(entries)
+    end
+  end
+
   describe 'meta_delete' do
     let(:key) { SecureRandom.hex(4) }
     let(:cas) { rand(1000..1999) }

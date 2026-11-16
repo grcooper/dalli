@@ -156,7 +156,9 @@ module Dalli
         ttl = TtlSanitizer.sanitize(ttl) if ttl
         entries, value_error = marshal_entries(keys, pairs, options, log: true)
         unless entries.empty?
-          write(RequestFormatter.multi_meta_set(entries, ttl: ttl, terminate: false, **routing_token_kwargs(options)))
+          @connection_manager.write_parts(
+            RequestFormatter.multi_meta_set_parts(entries, ttl: ttl, terminate: false, **routing_token_kwargs(options))
+          )
         end
         value_error
       end
@@ -491,9 +493,9 @@ module Dalli
         entries, value_error = marshal_entries(pairs.each_key, pairs, req_options)
 
         unless entries.empty?
-          buffer = RequestFormatter.multi_meta_set(entries, ttl: ttl, **routing_token_kwargs(req_options))
-          flushed_write(buffer)
-          buffer.clear
+          parts = RequestFormatter.multi_meta_set_parts(entries, ttl: ttl, **routing_token_kwargs(req_options))
+          @connection_manager.write_parts(parts)
+          @connection_manager.flush
           response_processor.consume_all_responses_until_mn(entries.size)
         end
         raise value_error if value_error
