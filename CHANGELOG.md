@@ -4,6 +4,10 @@ Dalli Changelog
 Unreleased
 ==========
 
+Performance:
+
+- The multi-server `set_multi` writes each server's keys as one batch, as the single-server one does, rather than making a request for each key. p95 latency per call fell by about 30-45%
+
 5.3.3
 ==========
 

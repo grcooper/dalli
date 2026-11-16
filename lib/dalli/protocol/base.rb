@@ -279,7 +279,7 @@ module Dalli
       # is the read behind get_cas.
       RESEND_SAFE_OPS = %i[get gat touch cas version stats reset_stats noop flush
                            read_multi_req read_multi_with_metadata_req pipelined_get pipelined_get_interleaved
-                           write_multi_req pipelined_set delete_multi_req pipelined_delete
+                           write_multi_req pipelined_set_multi delete_multi_req pipelined_delete
                            finish_pipelined_delete].freeze
       private_constant :RESEND_SAFE_OPS
 
@@ -320,7 +320,7 @@ module Dalli
         case opkey
         # Finished by finish_pipeline, once the replies are read
         when :pipelined_get, :pipelined_get_interleaved then nil
-        when :pipelined_set, :pipelined_delete then @connection_manager.finish_unanswered_request!
+        when :pipelined_set_multi, :pipelined_delete then @connection_manager.finish_unanswered_request!
         else
           if quiet? && opkey != :noop
             # Its reply is left on the socket; the end of the quiet block, or

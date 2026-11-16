@@ -118,7 +118,9 @@ module Dalli
           cmd << TERMINATOR
         end
 
-        def multi_meta_set(entries, ttl: nil, p_token: nil, l_token: nil)
+        # Pass terminate: false to leave off the trailing noop, for callers
+        # (the pipelined set) that send it separately.
+        def multi_meta_set(entries, ttl: nil, terminate: true, p_token: nil, l_token: nil)
           # Routing tokens apply to every entry in the batch, so the suffix is
           # built once rather than per entry. It's binary, like the buffer, so
           # a token with non-ASCII characters doesn't turn the buffer UTF-8.
@@ -141,7 +143,7 @@ module Dalli
             append_bytes(buffer, value)
             buffer << TERMINATOR
           end
-          buffer << META_NOOP
+          terminate ? buffer << META_NOOP : buffer
         end
 
         # Thundering herd protection flag:

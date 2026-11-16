@@ -349,6 +349,13 @@ describe Dalli::Protocol::Meta::RequestFormatter do
                                                                                     }, ttl: 42)
     end
 
+    it 'leaves off the noop with terminate: false' do
+      entries = { 'foo' => ['VALUE', 2433] }
+
+      assert_equal "ms foo 5 c F2433 MS q\r\nVALUE\r\n",
+                   Dalli::Protocol::Meta::RequestFormatter.multi_meta_set(entries, terminate: false)
+    end
+
     it 'applies routing tokens once, to every entry' do
       expected = <<~TXT
         ms foo 5 c F2433 MS q Ppod1\r
