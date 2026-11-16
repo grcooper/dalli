@@ -13,6 +13,11 @@ module Dalli
     ##
     class Meta < Base
       TERMINATOR = "\r\n"
+      TERMINATOR_BYTES = TERMINATOR.bytesize
+
+      # A get_multi value with more than this many bytes still to read gets a
+      # buffer of its own, sized for it (see read_large_value)
+      VALUE_BUFFER_MIN_BYTES = 128 * 1024
 
       def response_processor
         @response_processor ||= ResponseProcessor.new(@connection_manager, @value_marshaller)
@@ -409,26 +414,126 @@ module Dalli
       # A value that can't be deserialized raises Dalli::UnmarshalError, as
       # get does, but only after the rest of the replies are read, so the
       # connection is left in step. The first such error is raised.
+      #
+      # The replies are read into one buffer in large non-blocking reads,
+      # rather than a line and then a value at a time: IO#gets and IO#read go
+      # through the socket's 8 KiB buffer, which costs a system call or two
+      # per value. Each reply's place in the buffer is noted as it arrives,
+      # and the values are cut from it once the MN is read: cutting a value
+      # out of a String that is still appended to would copy the String.
+      # Every request before this one has had its replies read, so only this
+      # request's replies are read into the buffer.
       def read_multi_get_responses(is_raw, keys)
         expect_reply_keys(keys)
-        hash = {}
-        unmarshal_error = nil
+        # The first line is read with IO#gets, which waits for the replies to
+        # start in C rather than with a read that finds nothing and a
+        # wait_readable. What else it read is kept in the IO's buffer, where
+        # read_nonblock reads first.
+        buffer = @connection_manager.read_line
+        found = [] # key, value offset, value size and bitflags of each hit
+        offset = 0
         replies = 0
-        while (line = @connection_manager.read_line)
+        while (term = reply_line_end(buffer, offset))
+          line = buffer.byteslice(offset, term - offset)
           break if line.start_with?('MN')
 
           replies += 1
           raise Dalli::DalliError, 'Too many get_multi replies' if replies > keys.size
 
+          offset = term + TERMINATOR_BYTES
           next unless line.start_with?('VA ')
 
+          buffer, offset = note_multi_get_value(buffer, line, offset, is_raw, found)
+        end
+        multi_get_values(buffer, found)
+      end
+
+      # The offset of the CRLF ending the reply line at offset, reading until
+      # it arrives. Read a chunk at a time: what follows a line may be most
+      # of a large value, which is better read into a buffer of its own once
+      # its size is known (see read_large_value).
+      def reply_line_end(buffer, offset)
+        max_line_bytes = ConnectionManager::MAX_LINE_BYTES
+        until (term = buffer.byteindex(TERMINATOR, offset))
+          if buffer.bytesize - offset >= max_line_bytes
+            raise Dalli::DalliError, "Reply line without CRLF in the first #{max_line_bytes} bytes"
+          end
+
+          @connection_manager.read_more(buffer, Dalli::Socket::InstanceMethods::READ_CHUNK_SIZE)
+        end
+        raise Dalli::DalliError, "Reply line without CRLF in the first #{max_line_bytes} bytes" if
+          term - offset + TERMINATOR_BYTES > max_line_bytes
+
+        term
+      end
+
+      # Reads the value of a "VA <size> [f<flags>] k<key> ..." line, starting
+      # at offset, and notes it in found. Returns the buffer to read the next
+      # reply into, a new one after a large value, and the offset in it.
+      def note_multi_get_value(buffer, line, offset, is_raw, found)
+        processor = response_processor
+        size = processor.size_from_va_line(line)
+        processor.check_value_size!(size)
+        reply_end = offset + size + TERMINATOR_BYTES
+        return read_large_value(buffer, line, offset, size, is_raw, found) if
+          reply_end - buffer.bytesize > VALUE_BUFFER_MIN_BYTES
+
+        @connection_manager.read_more(buffer) while buffer.bytesize < reply_end
+        note_value(buffer, line, offset, offset, size, is_raw, found)
+        [buffer, reply_end]
+      end
+
+      # A value with most of its bytes still to come is read into a buffer of
+      # its own, sized for it, rather than growing the shared one. The values
+      # noted so far are cut from that one first, as it isn't appended to
+      # again, and so is this one's buffer once it's read: the replies after
+      # it go in a new buffer.
+      # rubocop:disable-next Metrics/ParameterLists
+      def read_large_value(buffer, line, offset, size, is_raw, found)
+        idx = 1
+        while idx < found.size
+          found[idx] = buffer.byteslice(found[idx], found[idx + 1]) if found[idx].is_a?(Integer)
+          idx += 4
+        end
+        reply_bytes = size + TERMINATOR_BYTES
+        value_buffer = String.new(capacity: reply_bytes, encoding: Encoding::BINARY)
+        value_buffer << buffer.byteslice(offset, buffer.bytesize - offset)
+        while value_buffer.bytesize < reply_bytes
+          @connection_manager.read_more(value_buffer, reply_bytes - value_buffer.bytesize)
+        end
+        note_value(value_buffer, line, 0, value_buffer.byteslice(0, size), size, is_raw, found)
+        [''.b, 0]
+      end
+
+      # Checks the CRLF after the value at offset and notes value, its
+      # offset or the value itself, in found
+      # rubocop:disable-next Metrics/ParameterLists
+      def note_value(buffer, line, offset, value, size, is_raw, found)
+        processor = response_processor
+        processor.raise_bad_value_terminator unless buffer.getbyte(offset + size) == 13 && # CR
+                                                    buffer.getbyte(offset + size + 1) == 10 # LF
+        key = processor.key_from_va_line(line)
+        return unless key
+
+        raise_unexpected_reply_key(key) if unexpected_reply_key?(key)
+        found << key << value << size << (is_raw ? 0 : processor.bitflags_from_va_line(line))
+      end
+
+      # A noted value is its offset and size in buffer, or the value itself
+      # once it's been cut from an earlier buffer (see read_large_value)
+      def multi_get_values(buffer, found)
+        hash = {}
+        unmarshal_error = nil
+        idx = 0
+        while idx < found.size
+          value = found[idx + 1]
+          value = buffer.byteslice(value, found[idx + 2]) if value.is_a?(Integer)
           begin
-            key, value = parse_multi_get_value(line, is_raw)
+            hash[found[idx]] = @value_marshaller.retrieve(value, found[idx + 3])
           rescue Dalli::UnmarshalError => e
             unmarshal_error ||= e
-            next
           end
-          hash[key] = value if key
+          idx += 4
         end
         raise unmarshal_error if unmarshal_error
 
@@ -440,21 +545,6 @@ module Dalli
       # connection; the caller treats this server's keys as missing.
       def raise_unexpected_reply_key(key)
         raise Dalli::UnexpectedReplyKeyError, "#{name} replied with a key that wasn't requested: #{key.inspect}"
-      end
-
-      # Reads the "VA <size> [f<flags>] k<key> ..." line in place rather than
-      # splitting it into tokens
-      def parse_multi_get_value(line, is_raw)
-        processor = response_processor
-        size = processor.size_from_va_line(line)
-        processor.check_value_size!(size)
-        value = processor.strip_value_terminator!(@connection_manager.read(size + TERMINATOR.bytesize))
-        key = processor.key_from_va_line(line)
-        return unless key
-
-        raise_unexpected_reply_key(key) if unexpected_reply_key?(key)
-        bitflags = is_raw ? 0 : processor.bitflags_from_va_line(line)
-        [key, @value_marshaller.retrieve(value, bitflags)]
       end
 
       # Single-server fast path for set_multi. Inlines request formatting to
