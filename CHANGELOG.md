@@ -6,6 +6,7 @@ Unreleased
 
 Performance:
 
+- The single-server `get_multi` reads its replies in large non-blocking reads into one buffer, rather than a line and then a value at a time through the socket's 8 KiB buffer, and reads a large value into a buffer sized for it. p95 latency per call fell by about 25-35% for values of 100 KB and up
 - The multi-server `get_multi` reads replies faster, most with large values: p95 latency per call fell by 40-65% for values of 10 KB and up. Reading the socket checked `read_nonblock`'s result with a `case` on Symbols, which Ruby compiles to a hash lookup that hashed every byte read; reads are now 64 KiB rather than 8 KiB, and are appended to the reply buffer without an intermediate copy
 
 5.3.3

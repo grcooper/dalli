@@ -356,6 +356,21 @@ module Dalli
         @sock.append_available(target)
       end
 
+      # Appends what's available to buffer, up to max_bytes, waiting up to
+      # socket_timeout for at least one byte. Returns buffer.
+      def read_more(buffer, max_bytes = Dalli::Socket::InstanceMethods::MAX_AVAILABLE_BYTES)
+        flush_write_buffer
+        size = buffer.bytesize
+        loop do
+          @sock.append_available(buffer, max_bytes)
+          return buffer if buffer.bytesize > size
+
+          @sock.wait_readable(socket_timeout) or raise Timeout::Error, "IO timeout reading from #{name}"
+        end
+      rescue SystemCallError, *TIMEOUT_ERRORS, *SSL_ERRORS, EOFError => e
+        error_on_request!(e)
+      end
+
       def max_allowed_failures
         @max_allowed_failures ||= @options[:socket_max_failures] || 2
       end
