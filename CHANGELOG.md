@@ -4,6 +4,10 @@ Dalli Changelog
 Unreleased
 ==========
 
+Development:
+
+- Added `bin/multi_latency`, which compares `get_multi` and `set_multi` p50/p95/p99 latency per call across git refs, payload sizes and server counts
+
 5.3.3
 ==========
 
